@@ -57,22 +57,32 @@ plt.rcParams.update({
 # %% [markdown]
 # ## 1. Load the data
 #
-# One file is needed: `olist_orders_dataset.csv` (one row per order, with its status and purchase
-# timestamp). The cell looks for it on Kaggle (`olistbr/brazilian-ecommerce` attached as input),
-# then in `../data/`, and otherwise downloads it from Olist's public GitHub repository.
+# Two files from the Olist dataset are used: `olist_orders_dataset.csv` (one row per order, with
+# its status and purchase timestamp) and, in section 10, `olist_customers_dataset.csv` (the
+# customer's state). `find_olist_file` looks for them **on Kaggle** (anywhere under
+# `/kaggle/input`, when the dataset `olistbr/brazilian-ecommerce` is attached), then in `../data/`
+# or `data/`, and otherwise downloads them from Olist's public GitHub repository.
 
 # %%
-CANDIDATES = [
-    Path("/kaggle/input/brazilian-ecommerce/olist_orders_dataset.csv"),
-    Path("../data/olist_orders_dataset.csv"),
-    Path("data/olist_orders_dataset.csv"),
-]
-SOURCE_URL = ("https://raw.githubusercontent.com/olist/work-at-olist-data/"
-              "master/datasets/olist_orders_dataset.csv")
+GITHUB_DATA = "https://raw.githubusercontent.com/olist/work-at-olist-data/master/datasets/"
 
-path = next((p for p in CANDIDATES if p.exists()), None)
-orders = pd.read_csv(path or SOURCE_URL, parse_dates=["order_purchase_timestamp"])
-print(f"Loaded from: {path or SOURCE_URL}")
+
+def find_olist_file(name: str) -> str:
+    """Kaggle input (any mount folder) → local data/ → Olist's GitHub."""
+    kaggle = Path("/kaggle/input")
+    if kaggle.exists():
+        found = next(kaggle.rglob(name), None)
+        if found:
+            return str(found)
+    for local in (Path("../data") / name, Path("data") / name):
+        if local.exists():
+            return str(local)
+    return GITHUB_DATA + name
+
+
+orders_path = find_olist_file("olist_orders_dataset.csv")
+orders = pd.read_csv(orders_path, parse_dates=["order_purchase_timestamp"])
+print(f"Loaded from: {orders_path}")
 print(f"{len(orders):,} orders, {orders.order_purchase_timestamp.min():%Y-%m-%d} → "
       f"{orders.order_purchase_timestamp.max():%Y-%m-%d}")
 orders.order_status.value_counts()
@@ -648,10 +658,7 @@ fig.savefig(FIG_DIR / "05_prophet_components.png", dpi=150); plt.show()
 #   with the regional plans by construction.
 
 # %%
-CUST_CANDIDATES = [Path("/kaggle/input/brazilian-ecommerce/olist_customers_dataset.csv"),
-                   Path("../data/olist_customers_dataset.csv"), Path("data/olist_customers_dataset.csv")]
-cpath = next((p for p in CUST_CANDIDATES if p.exists()), None)
-customers = pd.read_csv(cpath or SOURCE_URL.replace("olist_orders_dataset", "olist_customers_dataset"),
+customers = pd.read_csv(find_olist_file("olist_customers_dataset.csv"),
                         usecols=["customer_id", "customer_state"])
 with_state = placed.merge(customers, on="customer_id", how="left")
 TOP_STATES = with_state["customer_state"].value_counts().index[:5].tolist()

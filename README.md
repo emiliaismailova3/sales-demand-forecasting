@@ -153,6 +153,11 @@ The notebook finds the data on Kaggle (`olistbr/brazilian-ecommerce`), then in `
 otherwise downloads it from [Olist's public GitHub repository](https://github.com/olist/work-at-olist-data).
 A full run (about 300 model fits) takes a few minutes on a laptop.
 
+**On Kaggle:** create a notebook, *File → Import Notebook* with `notebooks/forecasting.ipynb`,
+then *Add Input* → dataset `olistbr/brazilian-ecommerce`. The notebook finds the CSV files
+anywhere under `/kaggle/input` and writes its charts to `/kaggle/working/figures`. No internet
+is needed.
+
 `notebooks/forecasting.py` is the plain-text source of the notebook (cells marked with `# %%`,
 easy to diff). `python scripts/build_notebook.py` regenerates the `.ipynb` from it.
 
