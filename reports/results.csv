@@ -1,0 +1,5 @@
+Model,MAE,RMSE,"MAPE, %",MAPE vs naive
+Prophet,30.24,40.21,10.7,-3.21 pp
+SARIMA,28.44,34.86,10.77,-3.14 pp
+Seasonal naive,38.89,51.23,13.91,+0.00 pp
+LightGBM,42.55,49.72,15.8,+1.89 pp
