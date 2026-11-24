@@ -1,0 +1,3 @@
+,"coverage, validation (224 days), %","coverage, test (28 days), %","average width, % of forecast"
+SARIMA,82.1,100.0,87.8
+Prophet + events,66.1,78.6,46.6

@@ -10,10 +10,13 @@
 # **Approach**
 # 1. Build a clean daily series and choose a stable period (verified on a plot).
 # 2. EDA: trend, weekly seasonality, Black Friday and two real 2018 disruptions.
-# 3. Time-based split: the last 28 days are the test set; nothing from them is used for fitting.
-# 4. Four models with the same 28-day horizon: **seasonal naive** baseline, **SARIMA**,
-#    **Prophet** with Brazilian holidays, **LightGBM** with calendar + lag features.
-# 5. Compare on MAE, RMSE and MAPE; plot forecast vs actual.
+# 3. Evaluation design: **every decision is made on 8 rolling validation windows**; the last
+#    28 days are the test set and are used exactly once, at the end.
+# 4. Models with the same 28-day horizon: **seasonal naive** baseline, **SARIMA**, **Prophet** with
+#    Brazilian holidays, **LightGBM** with calendar + lag features, and their averages.
+# 5. Metrics: WAPE (main), MAPE, MAE, RMSE, MASE, and the coverage of the forecast intervals.
+# 6. Many series: forecasts for the 5 largest states + the rest, with a global LightGBM model
+#    and bottom-up totals.
 
 # %%
 import logging
@@ -122,6 +125,8 @@ print(f"Series: {y.index.min():%Y-%m-%d} → {y.index.max():%Y-%m-%d}, {len(y)} 
 # ### 3.1 Trend, Black Friday and 2018 disruptions
 
 # %%
+# Scheduled events are on the calendar in advance; the strike was a surprise.
+SCHEDULED = {"Black Friday", "FIFA World Cup"}
 EVENTS = {  # dates are public knowledge, fixed before looking at the test period
     "Black Friday": ("2017-11-24", "2017-11-27"),
     "Truckers' strike": ("2018-05-21", "2018-05-31"),
@@ -206,137 +211,121 @@ for ax, (comp, title) in zip(axes, [(stl.trend, "Trend"), (stl.seasonal, "Weekly
 fig.tight_layout(); fig.savefig(FIG_DIR / "04_stl.png", dpi=150); plt.show()
 
 # %% [markdown]
-# ## 4. Train / test split by time
+# ## 4. Evaluation design: choose on validation windows, test once
 #
-# The **last 28 days (2018-07-24 → 2018-08-20) are the test set**, and everything before that is
-# training. **No random split:** in a time series neighbouring days are strongly correlated,
-# so a random split would put days *between* known neighbours into the test set. The model
-# would be interpolating, not forecasting, and the score would be over-optimistic. In
-# production we always forecast the future from the past, and the split must imitate that.
+# **No random split.** Neighbouring days are strongly correlated, so a random split would put
+# days *between* known neighbours into the test set: the model would be interpolating, not
+# forecasting. Every evaluation below imitates production: fit on the past, forecast the next
+# 28 days.
+#
+# **One test window is not enough to choose models,** and choosing on it is cheating. So the
+# protocol is:
+#
+# 1. **Test set: the last 28 days (2018-07-24 → 2018-08-20).** Used exactly once, at the very end.
+# 2. **8 validation windows:** the eight 28-day periods before the test (Dec 2017 → Jul 2018).
+#    For each one, every model is refitted on the data before it and forecasts it (rolling origin).
+# 3. **Every decision is made on the validation windows only:** the SARIMA orders, whether to
+#    use the special-event information, and which models to combine in the ensemble.
+#
+# **Events and what was known when.** A forecaster knows the calendar but not the news:
+# * **Scheduled events** (Black Friday, the FIFA World Cup) are announced long in advance, so the
+#   model gets their full dates, also when they fall inside the forecast window.
+# * **Unscheduled events** (the truckers' strike) are only known once they have started, and only
+#   up to the forecast date. In the window starting 2018-05-01 nobody knew about the strike, so
+#   the model does not either.
+#
+# Section 9.4 repeats the whole selection with a stricter rule (scheduled events treated as
+# surprises too) to show how much the conclusion depends on this choice.
 
 # %%
+N_VALID = 8
+WINDOW_ENDS = [len(y) - k * HORIZON for k in range(N_VALID, -1, -1)]   # 9 windows, the last one is the test
 train, test = y.iloc[:-HORIZON], y.iloc[-HORIZON:]
-print(f"Train: {train.index.min():%Y-%m-%d} → {train.index.max():%Y-%m-%d} ({len(train)} days)")
-print(f"Test:  {test.index.min():%Y-%m-%d} → {test.index.max():%Y-%m-%d} ({len(test)} days), "
-      f"mean {test.mean():.0f} orders/day, min {test.min():.0f}")
+dev_start = y.index[WINDOW_ENDS[0] - HORIZON]
+
+windows = pd.DataFrame({
+    "role": ["validation"] * N_VALID + ["test"],
+    "first day": [y.index[e - HORIZON].date() for e in WINDOW_ENDS],
+    "last day": [y.index[e - 1].date() for e in WINDOW_ENDS],
+    "mean orders/day": [round(y.iloc[e - HORIZON:e].mean()) for e in WINDOW_ENDS],
+})
+print(f"Test: {test.index.min():%Y-%m-%d} → {test.index.max():%Y-%m-%d}, mean {test.mean():.0f} orders/day, "
+      f"min {test.min():.0f}")
+windows
 
 # %% [markdown]
 # ## 5. Metrics
 #
-# * **MAE**: average absolute error in orders. Easy to explain ("we miss by ~30 orders a day").
-# * **RMSE**: squares the errors first, so it penalises large misses more. Useful when one bad
-#   day is costly (e.g. not enough couriers).
-# * **MAPE**: average absolute error **in % of the actual value**. Scale-free, so it can be
-#   compared across products or stores. **Weakness:** it divides by the actual value, so when
-#   actuals are close to zero (a slow product, a night hour) it explodes or is undefined. It also
-#   penalises over-forecasts more than under-forecasts. Here it is safe: the smallest test value
-#   is 175 orders.
+# * **WAPE** (main metric): total absolute error divided by total orders. "We miss 9% of the
+#   orders over the 4 weeks." Unlike MAPE, a single low day cannot blow it up.
+# * **MAPE**: average absolute error in % of each day's actual. Familiar, but it divides by the
+#   actual value, so it explodes when actuals are near zero (it is safe here: the smallest
+#   test value is 175 orders) and it punishes over-forecasts more than under-forecasts.
+# * **MAE / RMSE**: errors in orders; RMSE penalises large misses more (one bad day can mean
+#   no couriers).
+# * **MASE**: MAE divided by the in-sample MAE of the "same weekday last week" forecast.
+#   Below 1 means better than that simple rule; it is comparable across series of any size.
 
 # %%
-def metrics(actual, forecast) -> dict:
+def metrics(actual, forecast, insample=None) -> dict:
     a, f = np.asarray(actual, float), np.asarray(forecast, float)
-    return {"MAE": np.mean(np.abs(a - f)),
-            "RMSE": np.sqrt(np.mean((a - f) ** 2)),
-            "MAPE, %": np.mean(np.abs((a - f) / a)) * 100}
-
-forecasts = {}
-
-# %% [markdown]
-# ## 6. Model 1: seasonal naive (baseline)
-#
-# "Each day equals the same weekday one week earlier." Over a 28-day horizon we only know data
-# up to the end of the training set, so the **last observed week is repeated four times**.
-# Every real model has to beat this baseline, otherwise it adds complexity for nothing.
-
-# %%
-forecasts["Seasonal naive"] = pd.Series(np.tile(train.iloc[-7:].values, HORIZON // 7), index=test.index)
-pd.DataFrame({"actual": test, "seasonal naive": forecasts["Seasonal naive"]}).head(10)
+    out = {"MAE": np.mean(np.abs(a - f)),
+           "RMSE": np.sqrt(np.mean((a - f) ** 2)),
+           "MAPE, %": np.mean(np.abs((a - f) / a)) * 100,
+           "WAPE, %": np.abs(a - f).sum() / a.sum() * 100}
+    if insample is not None:
+        s = np.asarray(insample, float)
+        out["MASE"] = out["MAE"] / np.mean(np.abs(s[7:] - s[:-7]))
+    return out
 
 # %% [markdown]
-# ## 7. Model 2: SARIMA with weekly seasonality
+# ## 6. The models
 #
-# **SARIMA(p,d,q)(P,D,Q,7)** models the series as a function of its own past values
-# (AR, `p`) and past errors (MA, `q`), after differencing:
-# * `d=1` removes the trend (we model day-to-day changes),
-# * `D=1, s=7` removes the weekly pattern (we compare with the same weekday last week),
-# * `P, Q` are the seasonal AR/MA terms at lag 7.
+# All models forecast the **same 28 days at once from the same history.**
 #
-# We fit on **`log(orders)`**: weekly swings are proportional to the level (see STL), and the log
-# turns multiplicative effects into additive ones, which is what SARIMA assumes. The orders
-# `p, q, P, Q` are chosen by **AIC on the training data only** (small grid search).
+# ### 6.1 Seasonal naive (baseline)
+# "Each day equals the same weekday one week earlier." With a 28-day horizon only the last
+# observed week is known, so it is **repeated four times**. Every real model has to beat this.
+#
+# ### 6.2 SARIMA with weekly seasonality
+# **SARIMA(p,d,q)(P,D,Q,7)** models the series from its own past values (AR, `p`) and past errors
+# (MA, `q`) after differencing: `d=1` removes the trend, `D=1, s=7` removes the weekly pattern,
+# and `P, Q` are the seasonal terms at lag 7. It is fitted on **`log(orders)`** because the weekly
+# swing is proportional to the level (see STL): the log makes it additive. The orders are chosen
+# by **AIC on the data before the first validation window**, so not even the validation windows
+# influence them.
 
 # %%
-log_train = np.log(train)
+log_dev = np.log(y[:dev_start - pd.Timedelta(days=1)])
 grid = []
 for p, q, P, Q in product([0, 1, 2], [0, 1, 2], [0, 1], [0, 1]):
     try:
-        fit = SARIMAX(log_train, order=(p, 1, q), seasonal_order=(P, 1, Q, 7)).fit(disp=False)
+        fit = SARIMAX(log_dev, order=(p, 1, q), seasonal_order=(P, 1, Q, 7)).fit(disp=False)
         grid.append(((p, 1, q), (P, 1, Q, 7), fit.aic))
     except Exception:
         continue
 grid = pd.DataFrame(grid, columns=["order", "seasonal_order", "AIC"]).sort_values("AIC")
 best_order, best_seasonal = grid.iloc[0, :2]
-print(f"Best by AIC: SARIMA{best_order}x{best_seasonal}")
+print(f"Best by AIC on data before {dev_start:%Y-%m-%d}: SARIMA{best_order}x{best_seasonal}")
 grid.head(5)
 
-# %%
-sarima = SARIMAX(log_train, order=best_order, seasonal_order=best_seasonal).fit(disp=False)
-sarima_fc = sarima.get_forecast(HORIZON)
-# Back-transform: exp of the forecast median on the log scale
-forecasts["SARIMA"] = np.exp(sarima_fc.predicted_mean).set_axis(test.index)
-sarima_ci = np.exp(sarima_fc.conf_int(alpha=0.2)).set_axis(test.index)  # 80% interval for the plot
-
 # %% [markdown]
-# ## 8. Model 3: Prophet with Brazilian holidays
+# ### 6.3 Prophet with Brazilian holidays
+# Prophet (Meta) fits **trend + weekly seasonality + holiday effects** as a regression, so each
+# part is interpretable. `add_country_holidays("BR")` adds Carnival, Tiradentes, Independence
+# Day and so on; multiplicative seasonality matches the STL finding; yearly seasonality is off
+# (1.5 years of data cannot estimate it). Two variants: **with and without the special events**
+# as extra "holidays". The validation windows decide which one we keep.
 #
-# Prophet (Meta) decomposes the series into **trend + weekly seasonality + holiday effects**
-# and fits them as a regression, so each component is interpretable.
-# * `add_country_holidays("BR")` adds the Brazilian public holidays (Carnival, Tiradentes,
-#   Independence Day, ...).
-# * The special events from the EDA (Black Friday + weekend, truckers' strike, World Cup) are
-#   added as custom "holidays". This tells Prophet that those dips and spikes are one-offs.
-#   Without them, the World Cup dip at the end of the training set pulls the trend down.
-# * `seasonality_mode="multiplicative"`: the weekly pattern scales with the level.
-# * Yearly seasonality is off: with ~1.5 years of data, one yearly cycle cannot be estimated
-#   reliably.
-
-# %%
-def prophet_events() -> pd.DataFrame:
-    return pd.concat([pd.DataFrame({"holiday": name, "ds": pd.date_range(a, b)})
-                      for name, (a, b) in EVENTS.items()], ignore_index=True)
-
-def fit_prophet(train_series: pd.Series, with_events: bool = True) -> pd.Series:
-    df = train_series.rename_axis("ds").reset_index(name="y")
-    m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False,
-                seasonality_mode="multiplicative",
-                holidays=prophet_events() if with_events else None)
-    m.add_country_holidays(country_name="BR")
-    m.fit(df)
-    future = m.make_future_dataframe(periods=HORIZON)
-    return m, m.predict(future)
-
-prophet_model, prophet_pred = fit_prophet(train)
-forecasts["Prophet"] = prophet_pred["yhat"].iloc[-HORIZON:].set_axis(test.index)
-fig = prophet_model.plot_components(prophet_pred, figsize=(10, 6))
-fig.savefig(FIG_DIR / "05_prophet_components.png", dpi=150); plt.show()
-
-# %% [markdown]
-# ## 9. Model 4: LightGBM with calendar and lag features
+# ### 6.4 LightGBM with calendar and lag features
+# Gradient boosting turns forecasting into a **tabular regression**: one row per day, target =
+# orders, features = calendar + the past.
 #
-# Gradient boosting does not know about time. We turn forecasting into a **tabular regression**:
-# each row is a day, the target is the orders on that day, and the features describe the
-# calendar and the past.
-#
-# **The leakage rule:** on the forecast date we know the data up to the end of training,
-# and we must predict up to **28 days ahead**. For the last test day, the most recent known
-# value is 28 days old. So **every lag must be ≥ 28 days**: `lag_28`, `lag_35`, `lag_42` (the
-# same weekday 4, 5 and 6 weeks ago). Rolling means are computed on the series **shifted by 28
-# days**. With `lag_1` or `lag_7` the model would train fine but in the test it would need
-# values from inside the test period, which do not exist at forecast time. That is data leakage,
-# and it makes the offline score better than anything achievable in production.
-#
-# This lets LightGBM forecast all 28 days at once from known data (the "direct" strategy), with
-# no recursion.
+# **The leakage rule:** at forecast time we know the data up to the last training day and must
+# predict up to 28 days ahead. For the last day the newest known value is 28 days old, so **every
+# lag must be ≥ 28 days** and rolling means are computed on the series **shifted by 28 days**.
+# With `lag_1` or `lag_7` the model would need values from inside the forecast period, which do
+# not exist yet (data leakage, and an offline score no one can reproduce in production).
 #
 # | Feature | Meaning |
 # |---|---|
@@ -344,225 +333,465 @@ fig.savefig(FIG_DIR / "05_prophet_components.png", dpi=150); plt.show()
 # | `is_holiday` | Brazilian public holiday (`holidays` package) |
 # | `lag_28`, `lag_35`, `lag_42` | orders on the same weekday 4, 5 and 6 weeks earlier |
 # | `rolling_mean_7`, `rolling_mean_28` | average level of the week / 4 weeks ending 28 days earlier |
-# | `is_event` | the day is inside a special event (Black Friday, strike, World Cup) |
-# | `lag_28_is_event` | the day used by `lag_28` was inside an event, so the lag is not representative |
+# | `is_event` (variant) | the day is inside a known special event; 0 for every future day |
+# | `lag_28_is_event` (variant) | the day used by `lag_28` was inside an event, so that lag is not representative |
+#
+# ### 6.5 Ensembles
+# Averages of two or three models. They are only useful if the models make **different errors**;
+# the validation windows decide which combination, if any, is worth it.
 
 # %%
 br_holidays = holidays.Brazil(years=range(2016, 2019))
-event_flag = pd.Series(0, index=y.index)
-for a, b in EVENTS.values():
-    event_flag[a:b] = 1
+holiday_days = pd.to_datetime(list(br_holidays.keys()))
 
 feat = pd.DataFrame({"orders": y})
 feat["dayofweek"] = feat.index.dayofweek
 feat["month"] = feat.index.month
 feat["day"] = feat.index.day
-feat["is_holiday"] = feat.index.isin(pd.to_datetime(list(br_holidays.keys()))).astype(int)
+feat["is_holiday"] = feat.index.isin(holiday_days).astype(int)
 for lag in (28, 35, 42):
     feat[f"lag_{lag}"] = feat["orders"].shift(lag)
 for w in (7, 28):
     feat[f"rolling_mean_{w}"] = feat["orders"].shift(HORIZON).rolling(w).mean()
-feat["is_event"] = event_flag
-feat["lag_28_is_event"] = event_flag.shift(28)
-
 BASE_FEATURES = ["dayofweek", "month", "day", "is_holiday", "lag_28", "lag_35", "lag_42",
                  "rolling_mean_7", "rolling_mean_28"]
-FEATURES = BASE_FEATURES + ["is_event", "lag_28_is_event"]
+EVENT_FEATURES = ["is_event", "lag_28_is_event"]
+LGBM_PARAMS = dict(n_estimators=300, learning_rate=0.03, num_leaves=15, min_child_samples=10,
+                   subsample=0.8, subsample_freq=1, colsample_bytree=0.8, random_state=SEED, verbose=-1)
 
-feat_train = feat.loc[train.index].dropna()   # first 42+ days have no lags yet
-feat_test = feat.loc[test.index]
-assert feat_test[FEATURES].notna().all().all()
-# Leakage check: the newest value any test feature depends on is from the training period
-print("Newest date used by lag_28 in the test set:", (test.index.max() - pd.Timedelta(days=28)).date(),
-      "| last training day:", train.index.max().date())
 
-def fit_lgbm(features):
-    model = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15,
-                              min_child_samples=10, subsample=0.8, subsample_freq=1,
-                              colsample_bytree=0.8, random_state=SEED, verbose=-1)
-    model.fit(feat_train[features], feat_train["orders"])
-    return model, pd.Series(model.predict(feat_test[features]), index=test.index)
+def known_events(last_train_day: pd.Timestamp, strict: bool = False) -> dict:
+    """What a planner knows on the forecast date.
 
-lgbm, forecasts["LightGBM"] = fit_lgbm(FEATURES)
+    Scheduled events (Black Friday, the World Cup) are on the calendar, so their full dates are
+    known, also when they fall inside the forecast window. An unscheduled event (the strike) is
+    only known once it has started, and only up to the forecast date. With strict=True scheduled
+    events are treated like surprises too (the sensitivity check in section 9.4).
+    """
+    horizon_end = last_train_day + pd.Timedelta(days=HORIZON)
+    known = {}
+    for n, (a, b) in EVENTS.items():
+        a, b = pd.Timestamp(a), pd.Timestamp(b)
+        if n in SCHEDULED and not strict:
+            if a <= horizon_end:
+                known[n] = (a, b)
+        elif a <= last_train_day:
+            known[n] = (a, min(b, last_train_day))
+    return known
 
-imp = pd.Series(lgbm.booster_.feature_importance("gain"), index=FEATURES).sort_values()
+
+def event_flags(index: pd.DatetimeIndex, events: dict) -> pd.Series:
+    flags = pd.Series(0, index=index)
+    for a, b in events.values():
+        flags[a:b] = 1
+    return flags
+
+
+def fc_naive(tr):
+    return np.tile(tr.iloc[-7:].values, HORIZON // 7), None, None
+
+
+def fc_sarima(tr, log=np.log, exp=np.exp):
+    res = SARIMAX(log(tr), order=best_order, seasonal_order=best_seasonal).fit(disp=False).get_forecast(HORIZON)
+    ci = res.conf_int(alpha=0.2).values   # 80% interval
+    return exp(res.predicted_mean.values), exp(ci[:, 0]), exp(ci[:, 1])
+
+
+def fc_prophet(tr, events):
+    hol = (pd.concat([pd.DataFrame({"holiday": n, "ds": pd.date_range(a, b)}) for n, (a, b) in events.items()])
+           if events else None)
+    m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False,
+                seasonality_mode="multiplicative", holidays=hol, interval_width=0.8, uncertainty_samples=500)
+    m.add_country_holidays(country_name="BR")
+    m.fit(tr.rename_axis("ds").reset_index(name="y"))
+    np.random.seed(SEED)   # Prophet samples its intervals; fix the seed so reruns match
+    p = m.predict(m.make_future_dataframe(periods=HORIZON)).iloc[-HORIZON:]
+    return p["yhat"].values, p["yhat_lower"].values, p["yhat_upper"].values
+
+
+def fc_lgbm(tr, events, return_model=False):
+    f = feat.copy()
+    if events is not None:
+        flags = event_flags(y.index, events)
+        f["is_event"], f["lag_28_is_event"] = flags, flags.shift(28)
+        # future days are flagged only for scheduled events (known_events leaves surprises out)
+    cols = BASE_FEATURES + (EVENT_FEATURES if events is not None else [])
+    f_tr = f.loc[tr.index].dropna(subset=cols)          # the first 42 days have no lags yet
+    f_fc = f.iloc[len(tr):len(tr) + HORIZON]
+    assert f_fc[cols].notna().all().all()
+    model = lgb.LGBMRegressor(**LGBM_PARAMS).fit(f_tr[cols], f_tr["orders"])
+    pred = model.predict(f_fc[cols])
+    return (pred, model, cols) if return_model else (pred, None, None)
+
+
+def forecast_window(end: int, strict: bool = False, only_event_models: bool = False) -> dict:
+    """Fit every model on y[:end-28] and forecast y[end-28:end]."""
+    tr = y.iloc[:end - HORIZON]
+    ev = known_events(tr.index[-1], strict=strict)
+    out = {"Prophet + events": fc_prophet(tr, ev), "LightGBM + events": fc_lgbm(tr, ev)}
+    if not only_event_models:
+        out.update({"Seasonal naive": fc_naive(tr), "SARIMA": fc_sarima(tr),
+                    "Prophet, no events": fc_prophet(tr, {}), "LightGBM, no events": fc_lgbm(tr, None)})
+    return out
+
+# %% [markdown]
+# ## 7. Run every model on the 8 validation windows and the test window
+# This is the expensive cell (about 30 model fits per window).
+
+# %%
+runs = {e: forecast_window(e) for e in WINDOW_ENDS}
+actuals = {e: y.iloc[e - HORIZON:e] for e in WINDOW_ENDS}
+insample = {e: y.iloc[:e - HORIZON] for e in WINDOW_ENDS}
+VALID_ENDS, TEST_END = WINDOW_ENDS[:-1], WINDOW_ENDS[-1]
+
+
+def window_table(names, metric="WAPE, %", ends=WINDOW_ENDS):
+    return pd.DataFrame({y.index[e - HORIZON].date(): {n: metrics(actuals[e], point(e, n))[metric] for n in names}
+                         for e in ends}).T
+
+
+def point(end, name):
+    """Point forecast of a single model or of an ensemble 'A + B (+ C)' average."""
+    if name.startswith("Avg("):
+        parts = name[4:-1].split(" | ")
+        return np.mean([runs[end][p][0] for p in parts], axis=0)
+    return runs[end][name][0]
+
+# %% [markdown]
+# ## 8. Decisions, made on the validation windows only
+# ### 8.1 Do the special events help?
+
+# %%
+variants = ["Seasonal naive", "SARIMA", "Prophet, no events", "Prophet + events", "LightGBM, no events", "LightGBM + events"]
+valid_wape = window_table(variants, ends=VALID_ENDS)
+valid_wape.round(1)
+
+# %%
+choice = {}
+for model in ("Prophet", "LightGBM"):
+    a, b = f"{model}, no events", f"{model} + events"
+    choice[model] = b if valid_wape[b].median() < valid_wape[a].median() else a
+    print(f"{model}: median validation WAPE {valid_wape[a].median():.1f}% without events, "
+          f"{valid_wape[b].median():.1f}% with events → keep '{choice[model]}'")
+
+# %% [markdown]
+# ### 8.2 Which ensemble, if any?
+# Every average of two or three of the kept models is scored on the validation windows, together
+# with the single models. The one with the lowest **median** validation WAPE becomes the final
+# model. Median rather than mean, because three windows are dominated by shocks no model can
+# foresee (see 8.3); the mean is shown too.
+
+# %%
+base = ["SARIMA", choice["Prophet"], choice["LightGBM"]]
+candidates = ["Seasonal naive", *base]
+for k in (2, 3):
+    for combo in __import__("itertools").combinations(base, k):
+        candidates.append(f"Avg({' | '.join(combo)})")
+cand_valid = window_table(candidates, ends=VALID_ENDS)
+selection = pd.DataFrame({
+    "median WAPE, %": cand_valid.median(), "mean WAPE, %": cand_valid.mean(),
+    "windows better than naive": cand_valid.lt(cand_valid["Seasonal naive"], axis=0).sum(),
+}).sort_values("median WAPE, %").round(1)
+selection.loc["Seasonal naive", "windows better than naive"] = np.nan
+FINAL = selection.index[0]
+print("Final model chosen on validation:", FINAL)
+selection.to_csv(FIG_DIR.parent / "validation_selection.csv")
+selection
+
+# %% [markdown]
+# ### 8.3 Where the models fail
+# The chart shows the validation WAPE of each window. The bad windows are the same for every
+# model: **December 2017** (right after Black Friday, then the holiday season), **May 2018**
+# (the truckers' strike started inside the window) and **late June 2018** (World Cup). Nothing
+# trained on history can foresee a strike; in practice this is handled by monitoring the error
+# and by planners adding known events as inputs.
+
+# %%
+show = ["Seasonal naive", "SARIMA", choice["Prophet"], choice["LightGBM"], FINAL]
+colors = [C["naive"], C["SARIMA"], C["Prophet"], C["LightGBM"], C["Ensemble"]]
+wape_all = window_table(show)
+fig, ax = plt.subplots(figsize=(11, 4))
+x = np.arange(len(wape_all)); w = 0.16
+for i, (name, col) in enumerate(zip(show, colors)):
+    ax.bar(x + (i - 2) * w, wape_all[name].clip(upper=60), width=w - 0.02, color=col, label=name)
+ax.axvspan(x[-1] - 0.5, x[-1] + 0.5, color="#f0efec", lw=0, zorder=0)
+ax.annotate("test", (x[-1], 57), ha="center", fontsize=9, color=C["muted"])
+ax.set_xticks(x, [d.strftime("%d %b %y") for d in wape_all.index], fontsize=9)
+ax.set(title="WAPE by 28-day window: 8 validation windows, then the test (capped at 60%)",
+       ylabel="WAPE, %", xlabel="window start")
+ax.grid(axis="x", visible=False); ax.legend(ncol=3, fontsize=9, loc="upper left")
+fig.tight_layout(); fig.savefig(FIG_DIR / "08_backtest.png", dpi=150); plt.show()
+
+# %% [markdown]
+# ## 9. The test month, evaluated once
+
+# %%
+test_models = ["Seasonal naive", "SARIMA", "Prophet, no events", "Prophet + events",
+               "LightGBM, no events", "LightGBM + events"] + [c for c in candidates if c.startswith("Avg(")]
+results = pd.DataFrame({n: metrics(test, point(TEST_END, n), insample[TEST_END]) for n in test_models}).T
+results.insert(0, "chosen on validation", ["final model" if n == FINAL else ("kept" if n in candidates else "")
+                                          for n in results.index])
+results = results.sort_values("WAPE, %").round(2)
+results.index.name = "Model"
+results.to_csv(FIG_DIR.parent / "results.csv")
+results
+
+# %% [markdown]
+# ### 9.1 Forecast vs actual
+
+# %%
+final_fc = pd.Series(point(TEST_END, FINAL), index=test.index)
+sar = runs[TEST_END]["SARIMA"]
+fig, ax = plt.subplots(figsize=(11, 4.5))
+hist = y["2018-05-15":train.index.max()]
+ax.plot(hist, color=C["muted"], lw=1, label="training data (end)")
+ax.axvspan(test.index.min(), test.index.max(), color="#f0efec", lw=0, zorder=0)
+ax.plot(test, color=C["actual"], lw=2.2, label="actual (test)")
+ax.fill_between(test.index, sar[1], sar[2], color=C["SARIMA"], alpha=0.12, lw=0, label="SARIMA 80% interval")
+lines = [("Seasonal naive", dict(color=C["naive"], ls="--")), ("SARIMA", dict(color=C["SARIMA"])),
+         (choice["Prophet"], dict(color=C["Prophet"])), (choice["LightGBM"], dict(color=C["LightGBM"]))]
+for name, style in lines:
+    ax.plot(test.index, point(TEST_END, name), lw=1.5, **style, label=f"{name} (WAPE {results.loc[name, 'WAPE, %']:.1f}%)")
+ax.plot(final_fc, color=C["Ensemble"], lw=2.6, label=f"final: {FINAL} (WAPE {results.loc[FINAL, 'WAPE, %']:.1f}%)")
+for text_, day in [("truckers' strike", "2018-05-26"), ("World Cup", "2018-06-29"), ("test period", "2018-08-07")]:
+    ax.annotate(text_, (pd.Timestamp(day), 60), fontsize=9, color=C["muted"], ha="center")
+ax.set_ylim(40, None)
+ax.set(title="28-day forecast vs actual daily orders (test month)", ylabel="orders per day")
+ax.legend(loc="upper left", ncol=2, fontsize=8.5)
+fig.tight_layout(); fig.savefig(FIG_DIR / "07_forecast_vs_actual.png", dpi=150); plt.show()
+
+# %% [markdown]
+# ### 9.2 Are the forecast intervals honest?
+# For planning, the interval matters more than the point forecast: staffing should cover the
+# upper bound. An **80% interval should contain about 80% of the actual days.** We check this
+# over all 8 validation windows (224 days) and on the test month.
+
+# %%
+def coverage(name, ends):
+    inside = [((actuals[e].values >= runs[e][name][1]) & (actuals[e].values <= runs[e][name][2])) for e in ends]
+    return np.concatenate(inside).mean() * 100
+
+def width(name, ends):
+    return np.mean([np.mean((runs[e][name][2] - runs[e][name][1]) / runs[e][name][0]) for e in ends]) * 100
+
+coverage_table = pd.DataFrame({
+    n: {"coverage, validation (224 days), %": coverage(n, VALID_ENDS), "coverage, test (28 days), %": coverage(n, [TEST_END]),
+        "average width, % of forecast": width(n, VALID_ENDS)}
+    for n in ["SARIMA", choice["Prophet"]]}).T.round(1)
+coverage_table.to_csv(FIG_DIR.parent / "interval_coverage.csv")
+coverage_table
+
+# %% [markdown]
+# ### 9.4 Sensitivity: what if scheduled events were treated as surprises?
+# The first version of this notebook used a stricter rule: every event, including the World Cup,
+# was only known up to the forecast date. Re-running the selection with that rule shows how much
+# the final answer depends on it. Only the two "+ events" models change; everything else is reused.
+
+# %%
+strict_runs = {e: {**runs[e], **forecast_window(e, strict=True, only_event_models=True)} for e in WINDOW_ENDS}
+saved_runs, runs = runs, strict_runs
+strict_choice = {}
+strict_valid = window_table(variants, ends=VALID_ENDS)
+for model in ("Prophet", "LightGBM"):
+    a, b = f"{model}, no events", f"{model} + events"
+    strict_choice[model] = b if strict_valid[b].median() < strict_valid[a].median() else a
+strict_base = ["SARIMA", strict_choice["Prophet"], strict_choice["LightGBM"]]
+strict_cands = ["Seasonal naive", *strict_base] + [f"Avg({' | '.join(c)})" for k in (2, 3)
+                                                   for c in __import__("itertools").combinations(strict_base, k)]
+strict_final = window_table(strict_cands, ends=VALID_ENDS).median().idxmin()
+sensitivity = pd.DataFrame({
+    "rule for scheduled events": ["known in advance (main)", "treated as surprises (strict)"],
+    "model chosen on validation": [FINAL, strict_final],
+    "test WAPE, %": [results.loc[FINAL, "WAPE, %"], metrics(test, point(TEST_END, strict_final))["WAPE, %"]],
+    "seasonal naive test WAPE, %": [results.loc["Seasonal naive", "WAPE, %"]] * 2,
+}).round(1)
+runs = saved_runs
+sensitivity.to_csv(FIG_DIR.parent / "sensitivity_event_rule.csv", index=False)
+sensitivity
+
+# %% [markdown]
+# ### 9.3 What LightGBM and Prophet learned
+
+# %%
+_, lgbm_model, lgbm_cols = fc_lgbm(train, known_events(train.index[-1]) if "events" in choice["LightGBM"] and "no" not in choice["LightGBM"] else None,
+                                   return_model=True)
+imp = pd.Series(lgbm_model.booster_.feature_importance("gain"), index=lgbm_cols).sort_values()
 fig, ax = plt.subplots(figsize=(7, 3.8))
 ax.barh(imp.index, imp / imp.sum(), color=C["LightGBM"], height=0.6)
 ax.set(title="LightGBM feature importance (share of gain)", xlabel="share of total gain")
 ax.grid(axis="y", visible=False)
 fig.tight_layout(); fig.savefig(FIG_DIR / "06_lgbm_importance.png", dpi=150); plt.show()
 
+ev = known_events(train.index[-1])
+m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False, seasonality_mode="multiplicative",
+            holidays=pd.concat([pd.DataFrame({"holiday": n, "ds": pd.date_range(a, b)}) for n, (a, b) in ev.items()]))
+m.add_country_holidays(country_name="BR")
+m.fit(train.rename_axis("ds").reset_index(name="y"))
+fig = m.plot_components(m.predict(m.make_future_dataframe(periods=HORIZON)), figsize=(10, 6))
+fig.savefig(FIG_DIR / "05_prophet_components.png", dpi=150); plt.show()
+
 # %% [markdown]
-# ## 10. Model 5: ensemble (SARIMA + Prophet)
+# ## 10. Many series: forecasting by state
 #
-# A simple average of the two best statistical models. They make **different errors**: SARIMA
-# extrapolates recent dynamics, while Prophet fits a smooth trend with explicit holiday effects.
-# Averaging cancels part of those errors. Equal weights, so nothing is tuned on the test set.
-
-# %%
-forecasts["Ensemble (SARIMA + Prophet)"] = (forecasts["SARIMA"] + forecasts["Prophet"]) / 2
-
-# %% [markdown]
-# ## 11. Results
-# ### 11.1 Comparison table (test period, 28 days)
-
-# %%
-results = (pd.DataFrame({name: metrics(test, fc) for name, fc in forecasts.items()}).T
-           .sort_values("MAPE, %").round(2))
-naive_mape = results.loc["Seasonal naive", "MAPE, %"]
-results["MAPE vs naive"] = (results["MAPE, %"] - naive_mape).round(2).map(lambda v: f"{v:+.2f} pp")
-results.index.name = "Model"
-results.to_csv(FIG_DIR.parent / "results.csv")
-results
-
-# %% [markdown]
-# ### 11.2 Forecast vs actual
-
-# %%
-fig, ax = plt.subplots(figsize=(11, 4.5))
-hist = y["2018-05-15":train.index.max()]
-ax.plot(hist, color=C["muted"], lw=1, label="training data (end)")
-ax.axvspan(test.index.min(), test.index.max(), color="#f0efec", lw=0, zorder=0)
-ax.plot(test, color=C["actual"], lw=2.2, label="actual (test)")
-ax.fill_between(test.index, sarima_ci.iloc[:, 0], sarima_ci.iloc[:, 1], color=C["SARIMA"], alpha=0.12, lw=0,
-                label="SARIMA 80% interval")
-styles = {"Seasonal naive": dict(color=C["naive"], ls="--"), "SARIMA": dict(color=C["SARIMA"]),
-          "Prophet": dict(color=C["Prophet"]), "LightGBM": dict(color=C["LightGBM"]),
-          "Ensemble (SARIMA + Prophet)": dict(color=C["Ensemble"], lw=2.4)}
-for name, fc in forecasts.items():
-    ax.plot(fc, **{"lw": 1.8, **styles[name]}, label=f"{name} (MAPE {results.loc[name, 'MAPE, %']:.1f}%)")
-ax.annotate("truckers' strike", (pd.Timestamp("2018-05-26"), 60), fontsize=9, color=C["muted"], ha="center")
-ax.annotate("World Cup", (pd.Timestamp("2018-06-29"), 60), fontsize=9, color=C["muted"], ha="center")
-ax.annotate("test period", (pd.Timestamp("2018-08-07"), 60), fontsize=9, color=C["muted"], ha="center")
-ax.set_ylim(40, None)
-ax.set(title="28-day forecast vs actual daily orders", ylabel="orders per day")
-ax.legend(loc="upper left", ncol=2, fontsize=9)
-fig.tight_layout(); fig.savefig(FIG_DIR / "07_forecast_vs_actual.png", dpi=150); plt.show()
-
-# %% [markdown]
-# ### 11.3 What made the difference: handling the special events
+# A real planning team does not need one national number; it needs the volume **per region**
+# (warehouses and couriers are regional). This also shows where gradient boosting earns its
+# place: one **global** LightGBM model learns from all series at once, while SARIMA and Prophet
+# fit each series alone.
 #
-# Same models, same split, but **without** the event information. This shows how much of the
-# improvement comes from domain knowledge rather than from the algorithm.
+# * **Series:** orders per day for the 5 largest customer states (SP, RJ, MG, RS, PR) and
+#   "Other" for the rest. The six series add up exactly to the national total.
+# * **Global LightGBM:** one model, rows = (state, day). Features are the same as above plus the
+#   state as a category. Lags and the target are divided by the state's own level (the 28-day
+#   mean ending 28 days earlier), so a small and a large state share one pattern.
+# * **Same protocol:** 8 validation windows, then the test month once, all with refits.
+# * **Bottom-up:** summing the six state forecasts gives a national forecast that is consistent
+#   with the regional plans by construction.
 
 # %%
-_, prophet_plain = fit_prophet(train, with_events=False)
-_, lgbm_plain = fit_lgbm(BASE_FEATURES)
-ablation = pd.DataFrame({
-    "Prophet, BR holidays only": metrics(test, prophet_plain["yhat"].iloc[-HORIZON:].values),
-    "Prophet, BR holidays + events": metrics(test, forecasts["Prophet"]),
-    "LightGBM, required features only": metrics(test, lgbm_plain),
-    "LightGBM, + event features": metrics(test, forecasts["LightGBM"]),
-}).T.round(2)
-ablation
+CUST_CANDIDATES = [Path("/kaggle/input/brazilian-ecommerce/olist_customers_dataset.csv"),
+                   Path("../data/olist_customers_dataset.csv"), Path("data/olist_customers_dataset.csv")]
+cpath = next((p for p in CUST_CANDIDATES if p.exists()), None)
+customers = pd.read_csv(cpath or SOURCE_URL.replace("olist_orders_dataset", "olist_customers_dataset"),
+                        usecols=["customer_id", "customer_state"])
+with_state = placed.merge(customers, on="customer_id", how="left")
+TOP_STATES = with_state["customer_state"].value_counts().index[:5].tolist()
+with_state["region"] = with_state["customer_state"].where(with_state["customer_state"].isin(TOP_STATES), "Other")
+panel = (with_state.groupby([pd.Grouper(key="order_purchase_timestamp", freq="D"), "region"]).size()
+         .unstack(fill_value=0).asfreq("D", fill_value=0).reindex(y.index, fill_value=0)[TOP_STATES + ["Other"]]
+         .astype(float))
+assert np.allclose(panel.sum(axis=1), y), "states must add up to the national total"
+print("Share of orders:", (panel.sum() / panel.sum().sum() * 100).round(1).to_dict())
+print("Mean orders/day in the test month:", panel.loc[test.index].mean().round(0).to_dict())
+
+# %%
+use_events_lgbm = choice["LightGBM"] == "LightGBM + events"
+use_events_prophet = choice["Prophet"] == "Prophet + events"
+
+
+def panel_frame(events) -> pd.DataFrame:
+    flags = event_flags(y.index, events) if events is not None else None
+    parts = []
+    for s in panel.columns:
+        v = panel[s]
+        level = v.shift(HORIZON).rolling(28).mean().clip(lower=1)
+        d = pd.DataFrame({"orders": v, "series": s, "level": level, "target": v / level,
+                          "dayofweek": y.index.dayofweek, "month": y.index.month, "day": y.index.day,
+                          "is_holiday": y.index.isin(holiday_days).astype(int)}, index=y.index)
+        for lag in (28, 35, 42):
+            d[f"lag_{lag}"] = v.shift(lag) / level
+        d["rolling_mean_7"] = v.shift(HORIZON).rolling(7).mean() / level
+        if flags is not None:
+            d["is_event"], d["lag_28_is_event"] = flags, flags.shift(28)
+        parts.append(d)
+    out = pd.concat(parts)
+    out["series"] = out["series"].astype("category")
+    return out
+
+
+PANEL_FEATURES = ["series", "dayofweek", "month", "day", "is_holiday", "lag_28", "lag_35", "lag_42", "rolling_mean_7"]
+
+
+def panel_window(end: int) -> dict:
+    tr_idx, fc_idx = y.index[:end - HORIZON], y.index[end - HORIZON:end]
+    ev = known_events(tr_idx[-1])
+    out = {"Seasonal naive": {}, "SARIMA": {}, "Prophet": {}}
+    for s in panel.columns:
+        tr = panel[s].loc[tr_idx]
+        out["Seasonal naive"][s] = fc_naive(tr)[0]
+        out["SARIMA"][s] = fc_sarima(tr, log=np.log1p, exp=np.expm1)[0]
+        out["Prophet"][s] = np.clip(fc_prophet(tr, ev if use_events_prophet else {})[0], 0, None)
+    frame = panel_frame(ev if use_events_lgbm else None)
+    cols = PANEL_FEATURES + (EVENT_FEATURES if use_events_lgbm else [])
+    f_tr = frame[frame.index.isin(tr_idx)].dropna(subset=cols)
+    f_fc = frame[frame.index.isin(fc_idx)]
+    model = lgb.LGBMRegressor(**{**LGBM_PARAMS, "n_estimators": 500, "num_leaves": 31, "min_child_samples": 20})
+    model.fit(f_tr[cols], f_tr["target"])
+    pred = model.predict(f_fc[cols]) * f_fc["level"].values
+    out["Global LightGBM"] = {s: np.clip(pred[(f_fc["series"] == s).values], 0, None) for s in panel.columns}
+    out["Avg(SARIMA | Global LightGBM)"] = {s: (out["SARIMA"][s] + out["Global LightGBM"][s]) / 2 for s in panel.columns}
+    return out
+
+
+panel_runs = {e: panel_window(e) for e in WINDOW_ENDS}
+
+# %%
+def panel_scores(end, name):
+    act = panel.iloc[end - HORIZON:end]
+    pred = pd.DataFrame(panel_runs[end][name], index=act.index)[act.columns]
+    return {"state-level WAPE, %": (act - pred).abs().values.sum() / act.values.sum() * 100,
+            "bottom-up national WAPE, %": metrics(act.sum(axis=1), pred.sum(axis=1))["WAPE, %"]}
+
+panel_models = ["Seasonal naive", "SARIMA", "Prophet", "Global LightGBM", "Avg(SARIMA | Global LightGBM)"]
+panel_valid = pd.DataFrame({n: pd.DataFrame([panel_scores(e, n) for e in VALID_ENDS]).median() for n in panel_models}).T
+PANEL_FINAL = panel_valid["state-level WAPE, %"].idxmin()
+panel_summary = pd.concat({"validation (median of 8)": panel_valid,
+                           "test": pd.DataFrame({n: panel_scores(TEST_END, n) for n in panel_models}).T}, axis=1).round(1)
+panel_summary.to_csv(FIG_DIR.parent / "state_results.csv")
+print("Chosen on validation for the state level:", PANEL_FINAL)
+panel_summary
+
+# %%
+act = panel.loc[test.index]
+pred = pd.DataFrame(panel_runs[TEST_END][PANEL_FINAL], index=test.index)[act.columns]
+per_state = pd.DataFrame({
+    "mean orders/day": act.mean(),
+    f"WAPE {PANEL_FINAL}, %": (act - pred).abs().sum() / act.sum() * 100,
+    "WAPE seasonal naive, %": (act - pd.DataFrame(panel_runs[TEST_END]["Seasonal naive"], index=test.index)).abs().sum() / act.sum() * 100,
+}).round(1)
+per_state
+
+# %%
+fig, axes = plt.subplots(2, 3, figsize=(12, 5.5), sharex=True)
+for ax, s in zip(axes.flat, panel.columns):
+    ax.plot(panel[s]["2018-06-01":train.index.max()], color=C["muted"], lw=0.9)
+    ax.axvspan(test.index.min(), test.index.max(), color="#f0efec", lw=0, zorder=0)
+    ax.plot(act[s], color=C["actual"], lw=1.8)
+    ax.plot(pred[s], color=C["Ensemble"], lw=1.8)
+    ax.set_title(f"{s}: WAPE {per_state.loc[s, f'WAPE {PANEL_FINAL}, %']:.0f}%", loc="left", fontsize=10)
+    ax.tick_params(axis="x", labelsize=8, rotation=30)
+fig.suptitle(f"Test month by state: actual (black) vs {PANEL_FINAL} (purple)", fontweight="bold")
+fig.tight_layout(); fig.savefig(FIG_DIR / "09_states.png", dpi=150); plt.show()
 
 # %% [markdown]
-# ### 11.4 Rolling-origin backtest: is the result stable?
+# ## 11. Conclusions
 #
-# One 28-day window is a small sample: a model can win by luck. A **rolling-origin backtest**
-# repeats the whole procedure on **9 consecutive 28-day windows** (Dec 2017 → Aug 2018). Each
-# time the models are refitted only on data before the window, exactly as in production.
-#
-# To keep it honest, a model only knows about events that **had already started before the
-# forecast date**. In the window starting 2018-05-01 nobody could have known about the truckers'
-# strike. SARIMA uses the order selected in section 7 to keep the run fast.
-
-# %%
-def backtest_window(end: int) -> dict:
-    tr, te = y.iloc[:end - HORIZON], y.iloc[end - HORIZON:end]
-    known = {n: (a, min(pd.Timestamp(b), tr.index[-1])) for n, (a, b) in EVENTS.items()
-             if pd.Timestamp(a) <= tr.index[-1]}
-    fc = {"Seasonal naive": np.tile(tr.iloc[-7:].values, HORIZON // 7)}
-    fc["SARIMA"] = np.exp(SARIMAX(np.log(tr), order=best_order, seasonal_order=best_seasonal)
-                          .fit(disp=False).forecast(HORIZON)).values
-    hol = (pd.concat([pd.DataFrame({"holiday": n, "ds": pd.date_range(a, b)}) for n, (a, b) in known.items()])
-           if known else None)
-    m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False,
-                seasonality_mode="multiplicative", holidays=hol)
-    m.add_country_holidays(country_name="BR")
-    m.fit(tr.rename_axis("ds").reset_index(name="y"))
-    fc["Prophet"] = m.predict(m.make_future_dataframe(periods=HORIZON))["yhat"].iloc[-HORIZON:].values
-    fc["Ensemble (SARIMA + Prophet)"] = (fc["SARIMA"] + fc["Prophet"]) / 2
-    f_tr = feat.loc[tr.index].dropna()
-    f_te = feat.loc[te.index].copy()
-    f_te["is_event"] = 0  # future events are unknown at forecast time
-    gbm = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15, min_child_samples=10,
-                            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
-                            random_state=SEED, verbose=-1).fit(f_tr[FEATURES], f_tr["orders"])
-    fc["LightGBM"] = gbm.predict(f_te[FEATURES])
-    return {"window start": te.index[0].date(), **{k: metrics(te, v)["MAPE, %"] for k, v in fc.items()}}
-
-backtest = pd.DataFrame([backtest_window(len(y) - k * HORIZON) for k in range(8, -1, -1)]).set_index("window start")
-backtest.round(1)
-
-# %%
-summary = pd.DataFrame({"mean MAPE, %": backtest.mean(), "median MAPE, %": backtest.median(),
-                        "windows beating naive": (backtest.lt(backtest["Seasonal naive"], axis=0)).sum()}
-                       ).sort_values("median MAPE, %").round(1)
-summary.loc["Seasonal naive", "windows beating naive"] = np.nan
-summary.to_csv(FIG_DIR.parent / "backtest_summary.csv")
-summary
-
-# %%
-fig, ax = plt.subplots(figsize=(11, 4))
-order = ["Seasonal naive", "SARIMA", "Prophet", "LightGBM", "Ensemble (SARIMA + Prophet)"]
-colors = [C["naive"], C["SARIMA"], C["Prophet"], C["LightGBM"], C["Ensemble"]]
-x = np.arange(len(backtest)); w = 0.16
-for i, (name, col) in enumerate(zip(order, colors)):
-    ax.bar(x + (i - 2) * w, backtest[name].clip(upper=60), width=w - 0.02, color=col, label=name)
-ax.set_xticks(x, [d.strftime("%d %b %y") for d in backtest.index], fontsize=9)
-ax.set(title="MAPE by 28-day backtest window (capped at 60%)", ylabel="MAPE, %", xlabel="window start")
-ax.grid(axis="x", visible=False); ax.legend(ncol=3, fontsize=9, loc="upper right")
-fig.tight_layout(); fig.savefig(FIG_DIR / "08_backtest.png", dpi=150); plt.show()
-
-# %% [markdown]
-# **Backtest takeaways**
-# * The **ensemble has the lowest median MAPE** across the 9 windows and beats the naive
-#   baseline in most of them. The hold-out result is not luck.
-# * **All models fail in the same windows**: December 2017 (right after Black Friday, then the
-#   holiday season), May 2018 (truckers' strike) and late June 2018 (World Cup). No model
-#   trained on history can foresee a strike. In practice this is handled by monitoring the
-#   forecast error and by planners adding known events (e.g. the World Cup schedule) as inputs.
-# * In "normal" months the ensemble's error is ~8–12%.
-
-# %% [markdown]
-# ## 12. Conclusions
-#
-# * **The SARIMA + Prophet ensemble is the best model**: MAPE ~10.2% on the hold-out month
-#   against 13.9% for the seasonal naive baseline. It also has the lowest median MAPE in the
-#   9-window backtest. Individually SARIMA (10.8%) and Prophet (10.7%) are tied. Averaging them
-#   helps because they make different errors.
-# * **Seasonal naive is a strong baseline.** The weekly cycle explains most of the variation, so
-#   a model has to earn its complexity.
-# * **LightGBM is the weakest here.** That is not because boosting is bad. With a 28-day horizon
-#   it may only use lags ≥ 28, and those lags fall straight into the World Cup dip. Its
-#   features say "demand is low" exactly when demand recovered. Boosting shines with many
-#   related series (e.g. per-category or per-state forecasts) and richer features (promotions,
-#   prices, marketing).
-# * **Domain knowledge matters more than the algorithm.** Telling Prophet and LightGBM about the
-#   Black Friday / strike / World Cup windows cut their MAPE by roughly 16 and 5 points
-#   (section 10.3). The event dates come from the calendar, not from the test data.
+# * **Final model, chosen on validation only: the average of SARIMA and Prophet (with the special
+#   events).** On the untouched test month it reaches **WAPE 10.6% (MAPE 10.2%)** against **14.7%**
+#   for the seasonal-naive baseline, with MASE 0.79. On the 8 validation windows it has the lowest
+#   median WAPE (13.4% vs 20.1% naive) and beats the baseline in 6 of 8.
+# * **The result depends on one modelling assumption, and it is stated openly.** If scheduled events
+#   (the World Cup) are treated as unknown until they start, validation picks a different model and
+#   the test WAPE is 16.1%, worse than naive (section 9.4). Knowing the football calendar is
+#   realistic for a planner; knowing about the strike in advance is not, and the model never does.
+# * **Seasonal naive is a strong baseline.** The weekly cycle explains most of the variation, so a
+#   model has to earn its complexity. LightGBM on one series does not: with lags ≥ 28 days its
+#   features fall straight into the World Cup dip.
+# * **Intervals: trust SARIMA, not Prophet.** SARIMA's 80% interval covers 82% of validation days;
+#   Prophet's covers only 66%, so it is overconfident and would under-staff on busy days.
+# * **By state, the picture is mixed and reported as it is.** The average of per-state SARIMA and a
+#   global LightGBM was chosen on validation (state-level WAPE 20.8% vs 28.2% naive). On the test
+#   month it is still better than naive per state (20.1% vs 23.2%), and clearly so for the small
+#   states RS and PR, but per-state Prophet happened to do better on that one month (17.7%).
 #
 # **Limitations and next steps**
-# * The model variants were motivated by the EDA, and section 10.3 shows their effect on the same
-#   test window. A stricter setup would choose them on a separate validation window.
-# * Forecast intervals (SARIMA and Prophet provide them) matter more for planning than the point
-#   forecast: staffing should cover the upper bound.
-# * Next: forecast per product category or state and reconcile the totals, and add
-#   promotions and marketing spend as regressors.
+# * 8 validation windows are still a small sample, and three of them are dominated by shocks.
+# * The event list was written by hand from the EDA; a production system would take it from a
+#   maintained calendar and add promotions and marketing spend as regressors.
+# * Prophet's interval could be recalibrated on the validation windows (conformal prediction).
+# * Category-level forecasts with reconciliation (e.g. MinT) would be the next step for planning.
 
 # %% [markdown]
 # ## Interview notes
 #
 # * **Why not a random split?** Neighbouring days are correlated, and a random split leaks the
-#   future into training, so the model interpolates instead of forecasting. The score becomes too
-#   optimistic.
-# * **Why lags ≥ 28 in LightGBM?** The horizon is 28 days. For the last forecast day the newest
-#   known value is 28 days old. A shorter lag would use values that do not exist at forecast time
-#   (data leakage).
-# * **When is MAPE a bad metric?** When actual values are near zero (division by a tiny number),
-#   for intermittent demand, and when over- and under-forecasting should be penalised equally.
-#   Alternatives are MAE, WAPE (sum of absolute errors / sum of actuals) and MASE (error relative
-#   to the naive forecast).
-# * **Why log for SARIMA?** The weekly swing is proportional to the level (multiplicative). The
-#   log makes it additive and stabilises the variance.
+#   future into training, so the model interpolates instead of forecasting.
+# * **Why choose on validation windows and not on the test month?** Every choice made by looking at
+#   the test (which features, which ensemble) makes the test score optimistic. Here the test month
+#   was used once, after all decisions were fixed.
+# * **Why lags ≥ 28 in LightGBM?** The horizon is 28 days. For the last forecast day the newest known
+#   value is 28 days old. A shorter lag would use values that do not exist at forecast time.
+# * **WAPE vs MAPE?** MAPE averages daily percentage errors and explodes on small actuals; WAPE
+#   divides the total error by total volume, so it reflects the business cost. MASE compares with
+#   the naive forecast and works across series of any size.
+# * **Why log for SARIMA?** The weekly swing is proportional to the level (multiplicative). The log
+#   makes it additive and stabilises the variance.

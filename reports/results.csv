@@ -1,6 +1,11 @@
-Model,MAE,RMSE,"MAPE, %",MAPE vs naive
-Ensemble (SARIMA + Prophet),28.17,36.77,10.24,-3.67 pp
-Prophet,30.24,40.21,10.7,-3.21 pp
-SARIMA,28.44,34.86,10.77,-3.14 pp
-Seasonal naive,38.89,51.23,13.91,+0.00 pp
-LightGBM,42.55,49.72,15.8,+1.89 pp
+Model,chosen on validation,MAE,RMSE,"MAPE, %","WAPE, %",MASE
+Avg(SARIMA | Prophet + events),final model,28.21,36.92,10.24,10.64,0.79
+SARIMA,kept,28.4,34.66,10.8,10.71,0.79
+"Avg(SARIMA | Prophet + events | LightGBM, no events)",kept,30.95,40.25,10.91,11.67,0.86
+Prophet + events,kept,31.01,41.12,10.94,11.69,0.87
+"Avg(SARIMA | LightGBM, no events)",kept,32.77,41.04,11.65,12.36,0.92
+Seasonal naive,kept,38.89,51.23,13.91,14.67,1.09
+"Avg(Prophet + events | LightGBM, no events)",kept,40.35,48.09,14.54,15.22,1.13
+LightGBM + events,,42.55,49.72,15.8,16.05,1.19
+"LightGBM, no events",kept,56.05,62.98,21.12,21.14,1.57
+"Prophet, no events",,74.19,82.84,26.58,27.98,2.07

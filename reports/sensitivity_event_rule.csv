@@ -1,0 +1,3 @@
+rule for scheduled events,model chosen on validation,"test WAPE, %","seasonal naive test WAPE, %"
+known in advance (main),Avg(SARIMA | Prophet + events),10.6,14.7
+treated as surprises (strict),"Avg(SARIMA | Prophet, no events)",16.1,14.7
