@@ -1,0 +1,6 @@
+,"mean MAPE, %","median MAPE, %",windows beating naive
+Ensemble (SARIMA + Prophet),24.2,12.8,6.0
+Prophet,28.3,16.1,4.0
+SARIMA,26.2,19.1,6.0
+Seasonal naive,25.7,19.6,
+LightGBM,34.8,21.3,3.0

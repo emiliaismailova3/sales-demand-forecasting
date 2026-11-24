@@ -43,7 +43,7 @@ FIG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Chart colours: actual = ink, baseline = grey, models = fixed categorical order
 C = {"actual": "#0b0b0b", "naive": "#8a8986", "SARIMA": "#2a78d6",
-     "Prophet": "#eb6834", "LightGBM": "#1baf7a", "muted": "#52514e"}
+     "Prophet": "#eb6834", "LightGBM": "#1baf7a", "Ensemble": "#8e5ad6", "muted": "#52514e"}
 plt.rcParams.update({
     "figure.figsize": (11, 4), "figure.dpi": 110, "axes.spines.top": False,
     "axes.spines.right": False, "axes.grid": True, "grid.color": "#e6e5e1",
@@ -393,8 +393,18 @@ ax.grid(axis="y", visible=False)
 fig.tight_layout(); fig.savefig(FIG_DIR / "06_lgbm_importance.png", dpi=150); plt.show()
 
 # %% [markdown]
-# ## 10. Results
-# ### 10.1 Comparison table (test period, 28 days)
+# ## 10. Model 5: ensemble (SARIMA + Prophet)
+#
+# A simple average of the two best statistical models. They make **different errors**: SARIMA
+# extrapolates recent dynamics, while Prophet fits a smooth trend with explicit holiday effects.
+# Averaging cancels part of those errors. Equal weights, so nothing is tuned on the test set.
+
+# %%
+forecasts["Ensemble (SARIMA + Prophet)"] = (forecasts["SARIMA"] + forecasts["Prophet"]) / 2
+
+# %% [markdown]
+# ## 11. Results
+# ### 11.1 Comparison table (test period, 28 days)
 
 # %%
 results = (pd.DataFrame({name: metrics(test, fc) for name, fc in forecasts.items()}).T
@@ -406,7 +416,7 @@ results.to_csv(FIG_DIR.parent / "results.csv")
 results
 
 # %% [markdown]
-# ### 10.2 Forecast vs actual
+# ### 11.2 Forecast vs actual
 
 # %%
 fig, ax = plt.subplots(figsize=(11, 4.5))
@@ -417,9 +427,10 @@ ax.plot(test, color=C["actual"], lw=2.2, label="actual (test)")
 ax.fill_between(test.index, sarima_ci.iloc[:, 0], sarima_ci.iloc[:, 1], color=C["SARIMA"], alpha=0.12, lw=0,
                 label="SARIMA 80% interval")
 styles = {"Seasonal naive": dict(color=C["naive"], ls="--"), "SARIMA": dict(color=C["SARIMA"]),
-          "Prophet": dict(color=C["Prophet"]), "LightGBM": dict(color=C["LightGBM"])}
+          "Prophet": dict(color=C["Prophet"]), "LightGBM": dict(color=C["LightGBM"]),
+          "Ensemble (SARIMA + Prophet)": dict(color=C["Ensemble"], lw=2.4)}
 for name, fc in forecasts.items():
-    ax.plot(fc, lw=1.8, label=f"{name} (MAPE {results.loc[name, 'MAPE, %']:.1f}%)", **styles[name])
+    ax.plot(fc, **{"lw": 1.8, **styles[name]}, label=f"{name} (MAPE {results.loc[name, 'MAPE, %']:.1f}%)")
 ax.annotate("truckers' strike", (pd.Timestamp("2018-05-26"), 60), fontsize=9, color=C["muted"], ha="center")
 ax.annotate("World Cup", (pd.Timestamp("2018-06-29"), 60), fontsize=9, color=C["muted"], ha="center")
 ax.annotate("test period", (pd.Timestamp("2018-08-07"), 60), fontsize=9, color=C["muted"], ha="center")
@@ -429,7 +440,7 @@ ax.legend(loc="upper left", ncol=2, fontsize=9)
 fig.tight_layout(); fig.savefig(FIG_DIR / "07_forecast_vs_actual.png", dpi=150); plt.show()
 
 # %% [markdown]
-# ### 10.3 What made the difference: handling the special events
+# ### 11.3 What made the difference: handling the special events
 #
 # Same models, same split, but **without** the event information. This shows how much of the
 # improvement comes from domain knowledge rather than from the algorithm.
@@ -446,13 +457,81 @@ ablation = pd.DataFrame({
 ablation
 
 # %% [markdown]
-# ## 11. Conclusions
+# ### 11.4 Rolling-origin backtest: is the result stable?
 #
-# * **SARIMA (on log orders) and Prophet are tied at the top**: MAPE 10.8% and 10.7%, against
-#   13.9% for the seasonal naive baseline, about 3 percentage points better. SARIMA has the lowest
-#   MAE (−27% vs naive) and RMSE, so it makes fewer large misses, and I would pick it as the main
-#   model. Prophet's components (trend, weekday, holidays) are easier to explain to the business.
-#   A 0.07 pp MAPE gap on 28 days is noise, not a real difference.
+# One 28-day window is a small sample: a model can win by luck. A **rolling-origin backtest**
+# repeats the whole procedure on **9 consecutive 28-day windows** (Dec 2017 → Aug 2018). Each
+# time the models are refitted only on data before the window, exactly as in production.
+#
+# To keep it honest, a model only knows about events that **had already started before the
+# forecast date**. In the window starting 2018-05-01 nobody could have known about the truckers'
+# strike. SARIMA uses the order selected in section 7 to keep the run fast.
+
+# %%
+def backtest_window(end: int) -> dict:
+    tr, te = y.iloc[:end - HORIZON], y.iloc[end - HORIZON:end]
+    known = {n: (a, min(pd.Timestamp(b), tr.index[-1])) for n, (a, b) in EVENTS.items()
+             if pd.Timestamp(a) <= tr.index[-1]}
+    fc = {"Seasonal naive": np.tile(tr.iloc[-7:].values, HORIZON // 7)}
+    fc["SARIMA"] = np.exp(SARIMAX(np.log(tr), order=best_order, seasonal_order=best_seasonal)
+                          .fit(disp=False).forecast(HORIZON)).values
+    hol = (pd.concat([pd.DataFrame({"holiday": n, "ds": pd.date_range(a, b)}) for n, (a, b) in known.items()])
+           if known else None)
+    m = Prophet(weekly_seasonality=True, yearly_seasonality=False, daily_seasonality=False,
+                seasonality_mode="multiplicative", holidays=hol)
+    m.add_country_holidays(country_name="BR")
+    m.fit(tr.rename_axis("ds").reset_index(name="y"))
+    fc["Prophet"] = m.predict(m.make_future_dataframe(periods=HORIZON))["yhat"].iloc[-HORIZON:].values
+    fc["Ensemble (SARIMA + Prophet)"] = (fc["SARIMA"] + fc["Prophet"]) / 2
+    f_tr = feat.loc[tr.index].dropna()
+    f_te = feat.loc[te.index].copy()
+    f_te["is_event"] = 0  # future events are unknown at forecast time
+    gbm = lgb.LGBMRegressor(n_estimators=300, learning_rate=0.03, num_leaves=15, min_child_samples=10,
+                            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+                            random_state=SEED, verbose=-1).fit(f_tr[FEATURES], f_tr["orders"])
+    fc["LightGBM"] = gbm.predict(f_te[FEATURES])
+    return {"window start": te.index[0].date(), **{k: metrics(te, v)["MAPE, %"] for k, v in fc.items()}}
+
+backtest = pd.DataFrame([backtest_window(len(y) - k * HORIZON) for k in range(8, -1, -1)]).set_index("window start")
+backtest.round(1)
+
+# %%
+summary = pd.DataFrame({"mean MAPE, %": backtest.mean(), "median MAPE, %": backtest.median(),
+                        "windows beating naive": (backtest.lt(backtest["Seasonal naive"], axis=0)).sum()}
+                       ).sort_values("median MAPE, %").round(1)
+summary.loc["Seasonal naive", "windows beating naive"] = np.nan
+summary.to_csv(FIG_DIR.parent / "backtest_summary.csv")
+summary
+
+# %%
+fig, ax = plt.subplots(figsize=(11, 4))
+order = ["Seasonal naive", "SARIMA", "Prophet", "LightGBM", "Ensemble (SARIMA + Prophet)"]
+colors = [C["naive"], C["SARIMA"], C["Prophet"], C["LightGBM"], C["Ensemble"]]
+x = np.arange(len(backtest)); w = 0.16
+for i, (name, col) in enumerate(zip(order, colors)):
+    ax.bar(x + (i - 2) * w, backtest[name].clip(upper=60), width=w - 0.02, color=col, label=name)
+ax.set_xticks(x, [d.strftime("%d %b %y") for d in backtest.index], fontsize=9)
+ax.set(title="MAPE by 28-day backtest window (capped at 60%)", ylabel="MAPE, %", xlabel="window start")
+ax.grid(axis="x", visible=False); ax.legend(ncol=3, fontsize=9, loc="upper right")
+fig.tight_layout(); fig.savefig(FIG_DIR / "08_backtest.png", dpi=150); plt.show()
+
+# %% [markdown]
+# **Backtest takeaways**
+# * The **ensemble has the lowest median MAPE** across the 9 windows and beats the naive
+#   baseline in most of them. The hold-out result is not luck.
+# * **All models fail in the same windows**: December 2017 (right after Black Friday, then the
+#   holiday season), May 2018 (truckers' strike) and late June 2018 (World Cup). No model
+#   trained on history can foresee a strike. In practice this is handled by monitoring the
+#   forecast error and by planners adding known events (e.g. the World Cup schedule) as inputs.
+# * In "normal" months the ensemble's error is ~8–12%.
+
+# %% [markdown]
+# ## 12. Conclusions
+#
+# * **The SARIMA + Prophet ensemble is the best model**: MAPE ~10.2% on the hold-out month
+#   against 13.9% for the seasonal naive baseline. It also has the lowest median MAPE in the
+#   9-window backtest. Individually SARIMA (10.8%) and Prophet (10.7%) are tied. Averaging them
+#   helps because they make different errors.
 # * **Seasonal naive is a strong baseline.** The weekly cycle explains most of the variation, so
 #   a model has to earn its complexity.
 # * **LightGBM is the weakest here.** That is not because boosting is bad. With a 28-day horizon
@@ -465,8 +544,6 @@ ablation
 #   (section 10.3). The event dates come from the calendar, not from the test data.
 #
 # **Limitations and next steps**
-# * A single 28-day test window is a small sample. A rolling-origin backtest (several
-#   consecutive 28-day windows) would give a more reliable ranking.
 # * The model variants were motivated by the EDA, and section 10.3 shows their effect on the same
 #   test window. A stricter setup would choose them on a separate validation window.
 # * Forecast intervals (SARIMA and Prophet provide them) matter more for planning than the point

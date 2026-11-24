@@ -2,11 +2,13 @@
 
 Forecasting the number of **orders per day for the next 28 days** for a Brazilian e-commerce
 marketplace (Olist, ~99k orders, 2016–2018), comparing a seasonal-naive baseline, SARIMA,
-Prophet and LightGBM on a strict time-based holdout.
+Prophet, LightGBM and a SARIMA + Prophet ensemble on a strict time-based holdout and a
+9-window rolling-origin backtest.
 
 | | |
 |---|---|
-| **Best model** | SARIMA on log orders: **MAPE 10.8%** vs **13.9%** for the seasonal-naive baseline (−27% MAE). Prophet is tied (MAPE 10.7%) |
+| **Best model** | SARIMA + Prophet ensemble: **MAPE 10.2%** vs **13.9%** for the seasonal-naive baseline (−28% MAE) |
+| **Robustness** | 9-window backtest: median MAPE **12.8%** vs 19.6% naive; beats the baseline in 6 of 9 windows |
 | **Horizon / test** | 28 days, the last 4 weeks of data (2018-07-24 → 2018-08-20), never used for fitting |
 | **Stack** | Python · pandas · statsmodels (SARIMA, STL) · Prophet · LightGBM · matplotlib · Jupyter |
 
@@ -16,13 +18,30 @@ Prophet and LightGBM on a strict time-based holdout.
 
 | Model | MAE | RMSE | MAPE | vs naive |
 |---|---|---|---|---|
-| **SARIMA(1,1,1)(0,1,1)₇ on log** | **28.4** | **34.9** | 10.8% | −3.1 pp |
-| Prophet + BR holidays + events | 30.2 | 40.2 | **10.7%** | −3.2 pp |
+| **Ensemble (SARIMA + Prophet)** | **28.2** | 36.8 | **10.2%** | −3.7 pp |
+| SARIMA(1,1,1)(0,1,1)₇ on log | 28.4 | **34.9** | 10.8% | −3.1 pp |
+| Prophet + BR holidays + events | 30.2 | 40.2 | 10.7% | −3.2 pp |
 | Seasonal naive (last week repeated) | 38.9 | 51.2 | 13.9% | n/a |
 | LightGBM (calendar + lags ≥ 28) | 42.6 | 49.7 | 15.8% | +1.9 pp |
 
-Test mean: 265 orders/day. SARIMA and Prophet are statistically tied on MAPE; SARIMA is chosen
-because it has the lowest MAE and RMSE (fewer large misses).
+Test mean: 265 orders/day. SARIMA and Prophet make different errors, so their equal-weight
+average beats both.
+
+### Is it stable? Rolling-origin backtest (9 × 28-day windows, Dec 2017 → Aug 2018)
+
+| Model | Median MAPE | Mean MAPE | Windows beating naive |
+|---|---|---|---|
+| **Ensemble (SARIMA + Prophet)** | **12.8%** | **24.2%** | **6 / 9** |
+| Prophet | 16.1% | 28.3% | 4 / 9 |
+| SARIMA | 19.1% | 26.2% | 6 / 9 |
+| Seasonal naive | 19.6% | 25.7% | n/a |
+| LightGBM | 21.3% | 34.8% | 3 / 9 |
+
+Models only know events that had started before each forecast date. All models fail in the same
+windows (post-Black-Friday December, the truckers' strike, the World Cup), which no model trained
+on history can foresee. In normal months the ensemble's error is ~8–12%.
+
+![Backtest](reports/figures/08_backtest.png)
 
 **Takeaways**
 - **The seasonal-naive baseline is strong.** The weekly cycle (Mon/Tue busiest, Saturday −25%)
@@ -78,7 +97,6 @@ notebook runs in under a minute on a laptop.
 diff). `python scripts/build_notebook.py` regenerates the `.ipynb` from it.
 
 ## Limitations and next steps
-- One 28-day test window is a small sample. Next: a rolling-origin backtest over several windows.
 - The event handling was motivated by the EDA, and its effect is shown on the same test window.
   A stricter setup would choose model variants on a separate validation window.
 - Forecast intervals matter more than point forecasts for staffing. The SARIMA 80% interval is
@@ -92,7 +110,8 @@ diff). `python scripts/build_notebook.py` regenerates the `.ipynb` from it.
 │   ├── forecasting.ipynb     # main notebook (executed, with outputs)
 │   └── forecasting.py        # plain-text source of the notebook
 ├── reports/
-│   ├── results.csv           # comparison table
+│   ├── results.csv           # hold-out comparison table
+│   ├── backtest_summary.csv  # 9-window backtest summary
 │   └── figures/              # all charts
 ├── scripts/build_notebook.py # .py → .ipynb
 ├── data/                     # put olist_orders_dataset.csv here (optional, not committed)
