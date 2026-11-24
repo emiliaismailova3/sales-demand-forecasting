@@ -541,23 +541,23 @@ results
 
 # %%
 final_fc = pd.Series(point(TEST_END, FINAL), index=test.index)
+naive_fc = pd.Series(point(TEST_END, "Seasonal naive"), index=test.index)
 sar = runs[TEST_END]["SARIMA"]
+# Three lines only (actual, baseline, final model); every other model is in the table above.
 fig, ax = plt.subplots(figsize=(11, 4.5))
-hist = y["2018-05-15":train.index.max()]
-ax.plot(hist, color=C["muted"], lw=1, label="training data (end)")
+ax.plot(y["2018-05-15":train.index.max()], color=C["muted"], lw=1, label="history")
 ax.axvspan(test.index.min(), test.index.max(), color="#f0efec", lw=0, zorder=0)
-ax.plot(test, color=C["actual"], lw=2.2, label="actual (test)")
-ax.fill_between(test.index, sar[1], sar[2], color=C["SARIMA"], alpha=0.12, lw=0, label="SARIMA 80% interval")
-lines = [("Seasonal naive", dict(color=C["naive"], ls="--")), ("SARIMA", dict(color=C["SARIMA"])),
-         (choice["Prophet"], dict(color=C["Prophet"])), (choice["LightGBM"], dict(color=C["LightGBM"]))]
-for name, style in lines:
-    ax.plot(test.index, point(TEST_END, name), lw=1.5, **style, label=f"{name} (WAPE {results.loc[name, 'WAPE, %']:.1f}%)")
-ax.plot(final_fc, color=C["Ensemble"], lw=2.6, label=f"final: {FINAL} (WAPE {results.loc[FINAL, 'WAPE, %']:.1f}%)")
-for text_, day in [("truckers' strike", "2018-05-26"), ("World Cup", "2018-06-29"), ("test period", "2018-08-07")]:
+ax.fill_between(test.index, sar[1], sar[2], color=C["SARIMA"], alpha=0.12, lw=0, label="80% interval (SARIMA)")
+ax.plot(naive_fc, color=C["naive"], ls="--", lw=1.6,
+        label=f"baseline: same weekday last week (WAPE {results.loc['Seasonal naive', 'WAPE, %']:.1f}%)")
+ax.plot(final_fc, color=C["Ensemble"], lw=2.6,
+        label=f"final model: SARIMA + Prophet average (WAPE {results.loc[FINAL, 'WAPE, %']:.1f}%)")
+ax.plot(test, color=C["actual"], lw=2.2, label="actual orders")
+for text_, day in [("truckers' strike", "2018-05-26"), ("World Cup", "2018-06-29"), ("test month", "2018-08-07")]:
     ax.annotate(text_, (pd.Timestamp(day), 60), fontsize=9, color=C["muted"], ha="center")
 ax.set_ylim(40, None)
-ax.set(title="28-day forecast vs actual daily orders (test month)", ylabel="orders per day")
-ax.legend(loc="upper left", ncol=2, fontsize=8.5)
+ax.set(title="28-day forecast vs actual daily orders (test month, never used for choosing)", ylabel="orders per day")
+ax.legend(loc="upper left", fontsize=9)
 fig.tight_layout(); fig.savefig(FIG_DIR / "07_forecast_vs_actual.png", dpi=150); plt.show()
 
 # %% [markdown]
